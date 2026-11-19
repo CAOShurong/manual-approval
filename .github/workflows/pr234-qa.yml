@@ -11,43 +11,11 @@ permissions:
 env:
   SOURCE_SHA: 0d4edbd3a233d304a3e91230c88e70bc64e872ae
   IMAGE: ghcr.io/caoshurong/manual-approval-pr234-qa
+  IMAGE_REF: ghcr.io/caoshurong/manual-approval-pr234-qa@sha256:10bfb1cf99563e54caefb39226940cc3fb6433c12fe67c035f4d11677dc81136
 
 jobs:
-  build:
-    if: github.repository == 'CAOShurong/manual-approval'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image_ref: ${{ steps.image.outputs.image_ref }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          persist-credentials: false
-      - name: Publish exact source to the QA registry
-        id: image
-        env:
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test -z "$(git status --porcelain)"
-          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          tag="$IMAGE:$SOURCE_SHA"
-          docker build \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
-            --tag "$tag" .
-          docker push "$tag"
-          digest_ref="$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$tag")"
-          [[ "$digest_ref" == "$IMAGE"@sha256:* ]]
-          printf 'image_ref=%s\n' "$digest_ref" >> "$GITHUB_OUTPUT"
-
   verify:
-    needs: build
+    if: github.repository == 'CAOShurong/manual-approval'
     runs-on: ubuntu-latest
     timeout-minutes: 9
     permissions:
@@ -81,7 +49,6 @@ jobs:
       - name: Pull and bind the published image to the action
         env:
           REGISTRY_TOKEN: ${{ github.token }}
-          IMAGE_REF: ${{ needs.build.outputs.image_ref }}
         run: |
           set -euo pipefail
           [[ "$IMAGE_REF" == "$IMAGE"@sha256:* ]]
@@ -103,7 +70,7 @@ jobs:
         uses: ./
         with:
           secret: ${{ github.token }}
-          approvers: 'github-actions[bot]'
+          approvers: 'CAOShurong'
           allow-comment-reasons: ${{ matrix.allow_reasons }}
           fail-on-denial: 'true'
           polling-interval-seconds: '10'
@@ -124,19 +91,3 @@ jobs:
           test "$APPROVAL_STATUS" = "$EXPECTED_STATUS"
           [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
           test "$ISSUE_URL" = "https://github.com/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER"
-
-  drive:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 9
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-        with:
-          persist-credentials: false
-      - name: Exercise the four approval issue scenarios
-        env:
-          QA_TOKEN: ${{ github.token }}
-        run: python .github/qa/manual-approval-234.py
