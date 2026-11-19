@@ -1,0 +1,142 @@
+name: Manual approval PR 234 QA
+
+on:
+  push:
+    branches:
+      - qa/manual-approval-234-20261119
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: 0d4edbd3a233d304a3e91230c88e70bc64e872ae
+  IMAGE: ghcr.io/caoshurong/manual-approval-pr234-qa
+
+jobs:
+  build:
+    if: github.repository == 'CAOShurong/manual-approval'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Publish exact source to the QA registry
+        id: image
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          tag="$IMAGE:$SOURCE_SHA"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --tag "$tag" .
+          docker push "$tag"
+          digest_ref="$(docker image inspect --format '{{ index .RepoDigests 0 }}' "$tag")"
+          [[ "$digest_ref" == "$IMAGE"@sha256:* ]]
+          printf 'image_ref=%s\n' "$digest_ref" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    permissions:
+      contents: read
+      issues: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: reasons-enabled-approval
+            allow_reasons: 'true'
+            decision: approved
+            outcome: success
+          - name: reasons-enabled-denial
+            allow_reasons: 'true'
+            decision: denied
+            outcome: failure
+          - name: reasons-disabled-approval
+            allow_reasons: 'false'
+            decision: approved
+            outcome: success
+          - name: reasons-disabled-denial
+            allow_reasons: 'false'
+            decision: denied
+            outcome: failure
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Pull and bind the published image to the action
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          IMAGE_REF: ${{ needs.build.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_REF" == "$IMAGE"@sha256:* ]]
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker pull "$IMAGE_REF"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF")" = "$SOURCE_SHA"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path('action.yaml')
+          metadata = path.read_text()
+          released_image = 'docker://ghcr.io/trstringer/manual-approval:1.13.0'
+          assert metadata.count(released_image) == 1
+          path.write_text(metadata.replace(released_image, 'docker://' + os.environ['IMAGE_REF']))
+          PY
+      - name: Invoke the manual approval action
+        id: approval
+        continue-on-error: true
+        uses: ./
+        with:
+          secret: ${{ github.token }}
+          approvers: 'github-actions[bot]'
+          allow-comment-reasons: ${{ matrix.allow_reasons }}
+          fail-on-denial: 'true'
+          polling-interval-seconds: '10'
+          issue-title: 'MA-234 QA ${{ github.run_id }}/${{ github.run_attempt }} ${{ matrix.name }}'
+          issue-body: 'Synthetic QA for PR #234. This run has no deployment or release.'
+      - name: Check the terminal action outputs
+        env:
+          OUTCOME: ${{ steps.approval.outcome }}
+          APPROVAL_STATUS: ${{ steps.approval.outputs.approval-status }}
+          ISSUE_NUMBER: ${{ steps.approval.outputs.issue-number }}
+          ISSUE_URL: ${{ steps.approval.outputs.issue-url }}
+          EXPECTED_OUTCOME: ${{ matrix.outcome }}
+          EXPECTED_STATUS: ${{ matrix.decision }}
+        run: |
+          set -euo pipefail
+          printf 'outcome=%s status=%s issue=%s\n' "$OUTCOME" "$APPROVAL_STATUS" "$ISSUE_URL"
+          test "$OUTCOME" = "$EXPECTED_OUTCOME"
+          test "$APPROVAL_STATUS" = "$EXPECTED_STATUS"
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          test "$ISSUE_URL" = "https://github.com/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER"
+
+  drive:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Exercise the four approval issue scenarios
+        env:
+          QA_TOKEN: ${{ github.token }}
+        run: python .github/qa/manual-approval-234.py
